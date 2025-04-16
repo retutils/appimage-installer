@@ -160,6 +160,46 @@ validate_input() {
 }
 
 #######################################
+# Validate directories and permissions
+#######################################
+validate_directories() {
+    # Check if INSTALL_DIR is writable or can be created
+    if [[ ! -d "$INSTALL_DIR" ]]; then
+        if ! mkdir -p "$INSTALL_DIR" 2>/dev/null; then
+            echo "Error: Cannot create installation directory '$INSTALL_DIR'"
+            exit $ERR_INSTALL
+        fi
+    elif [[ ! -w "$INSTALL_DIR" ]]; then
+        echo "Error: Installation directory '$INSTALL_DIR' is not writable"
+        exit $ERR_INSTALL
+    fi
+
+    # Check if DESKTOP_ENTRY_DIR is writable or can be created
+    if [[ ! -d "$DESKTOP_ENTRY_DIR" ]]; then
+        if ! mkdir -p "$DESKTOP_ENTRY_DIR" 2>/dev/null; then
+            echo "Error: Cannot create desktop entry directory '$DESKTOP_ENTRY_DIR'"
+            exit $ERR_INSTALL
+        fi
+    elif [[ ! -w "$DESKTOP_ENTRY_DIR" ]]; then
+        echo "Error: Desktop entry directory '$DESKTOP_ENTRY_DIR' is not writable"
+        exit $ERR_INSTALL
+    fi
+
+    # Only check icon directory if we're going to use it
+    if [[ -n "$ICON_PATH" ]]; then
+        if [[ ! -d "$ICON_INSTALL_DIR" ]]; then
+            if ! mkdir -p "$ICON_INSTALL_DIR" 2>/dev/null; then
+                echo "Error: Cannot create icon directory '$ICON_INSTALL_DIR'"
+                exit $ERR_INSTALL
+            fi
+        elif [[ ! -w "$ICON_INSTALL_DIR" ]]; then
+            echo "Error: Icon directory '$ICON_INSTALL_DIR' is not writable"
+            exit $ERR_INSTALL
+        fi
+    fi
+}
+
+#######################################
 # Optional checksum verification
 #######################################
 verify_checksum() {
@@ -281,17 +321,25 @@ find_desktop_and_icon() {
 
         if $CREATE_FALLBACK_DESKTOP; then
             echo "Creating a fallback .desktop file."
-            DESKTOP_FILE="$TMPDIR/squashfs-root/fallback.desktop"
-            local fallback_name
-            fallback_name="$(basename "$APPIMAGE" .AppImage)"
+            # Get the base name without .AppImage extension
+            local base_name
+            base_name="$(basename "$APPIMAGE")"
+            base_name="${base_name%.AppImage}"  # Remove .AppImage extension if present
+            # Create a display name by replacing dots, dashes and underscores with spaces
+            local display_name
+            display_name="$(echo "$base_name" | sed 's/[-_.]/ /g' | sed 's/\b\(.\)/\u\1/g')"
+            
+            DESKTOP_FILE="$TMPDIR/squashfs-root/${base_name}.desktop"
+            APP_NAME="$base_name"
 
             cat <<EOF > "$DESKTOP_FILE"
 [Desktop Entry]
-Name=$fallback_name
-Exec=$fallback_name
-Icon=$fallback_name
+Name=$display_name
+Exec="$INSTALL_DIR/$base_name.AppImage" %F
+Icon=application-x-executable
 Type=Application
 Categories=Utility;
+Terminal=false
 EOF
         else
             echo "No fallback .desktop creation requested. Exiting."
@@ -302,54 +350,59 @@ EOF
     echo "Using desktop file: $DESKTOP_FILE"
     APP_NAME=$(basename "$DESKTOP_FILE" .desktop)
 
+    # Extract icon information from desktop file
     ICON_NAME=$(grep -i '^Icon=' "$DESKTOP_FILE" | head -n 1 | cut -d '=' -f2 | xargs)
     if [[ -z "$ICON_NAME" ]]; then
-        echo "Warning: No Icon entry found in .desktop file, setting an empty icon."
-        ICON_NAME="$APP_NAME"
+        echo "No Icon entry found in .desktop file, using default GNOME application icon."
+        ICON_NAME="application-x-executable"
     fi
 
     # Search for possible icon files in the extracted root
     ICON_PATH=$(find "$TMPDIR/squashfs-root" -type f \( -iname "${ICON_NAME}.png" -o -iname "${ICON_NAME}.svg" -o -iname "${ICON_NAME}.ico" \) | head -n 1)
     if [[ -z "$ICON_PATH" ]]; then
-        echo "Warning: Could not find an icon matching '${ICON_NAME}' in the AppImage."
-        # If no icon is found, we could create a placeholder or skip the icon.
-        # For now, let's skip it and let the .desktop reference a missing icon.
+        echo "No custom icon found in the AppImage, will use system default icon 'application-x-executable'"
         ICON_PATH=""
+        ICON_NAME="application-x-executable"
     else
         echo "Found icon: $ICON_PATH"
     fi
 }
 
 #######################################
-# Copy the AppImage and icon to the install directories
+# Copy files with error handling
 #######################################
 copy_files() {
-    # Ensure the install directory exists
-    if [[ ! -d "$INSTALL_DIR" ]]; then
-        echo "Creating install directory: $INSTALL_DIR"
-        execute mkdir -p "$INSTALL_DIR"
-    fi
-
-    # Name the installed file after the .desktop's base name
     local dest_appimage="$INSTALL_DIR/${APP_NAME}.AppImage"
     echo "Copying AppImage to $dest_appimage"
+    
+    if [[ -f "$dest_appimage" && ! $FORCE && ! $UPDATE && ! $REINSTALL ]]; then
+        echo "Error: Destination file already exists. Use -f to force overwrite, -u to update, or -r to reinstall."
+        exit $ERR_INSTALL
+    fi
+
     if $DRY_RUN; then
         echo "[DRY RUN] cp \"$APPIMAGE\" \"$dest_appimage\""
     else
-        cp "$APPIMAGE" "$dest_appimage"
-        chmod +x "$dest_appimage"
+        if ! cp "$APPIMAGE" "$dest_appimage"; then
+            echo "Error: Failed to copy AppImage to destination"
+            exit $ERR_INSTALL
+        fi
+        if ! chmod +x "$dest_appimage"; then
+            echo "Error: Failed to make AppImage executable"
+            exit $ERR_INSTALL
+        fi
     fi
 
-    # Copy icon (if we found one)
+    # Copy icon if we have one
     if [[ -n "$ICON_PATH" ]]; then
-        if [[ ! -d "$ICON_INSTALL_DIR" ]]; then
-            echo "Creating icon directory: $ICON_INSTALL_DIR"
-            execute mkdir -p "$ICON_INSTALL_DIR"
-        fi
         local ext="${ICON_PATH##*.}"
         local dest_icon="$ICON_INSTALL_DIR/${APP_NAME}.${ext}"
         echo "Copying icon to $dest_icon"
-        execute cp "$ICON_PATH" "$dest_icon"
+        if ! $DRY_RUN; then
+            if ! cp "$ICON_PATH" "$dest_icon"; then
+                echo "Warning: Failed to copy icon file"
+            fi
+        fi
     fi
 }
 
@@ -357,37 +410,57 @@ copy_files() {
 # Create a .desktop file in the user applications directory
 #######################################
 create_desktop_entry() {
-    execute mkdir -p "$DESKTOP_ENTRY_DIR"
     local dest_desktop="$DESKTOP_ENTRY_DIR/${APP_NAME}.desktop"
     echo "Creating desktop entry at $dest_desktop"
 
+    # Check if desktop file already exists
+    if [[ -f "$dest_desktop" && ! $FORCE && ! $UPDATE && ! $REINSTALL ]]; then
+        echo "Error: Desktop entry already exists. Use -f to force overwrite, -u to update, or -r to reinstall."
+        exit $ERR_INSTALL
+    fi
+
     local desktop_icon_ref=""
-    # If we successfully placed an icon, reference it
-    # (the extension might be png, svg, or something else)
+    # If we have a custom icon file, use its path
     if [[ -n "$ICON_PATH" ]]; then
         local icon_ext="${ICON_PATH##*.}"
         desktop_icon_ref="$ICON_INSTALL_DIR/${APP_NAME}.${icon_ext}"
+    else
+        # Use the ICON_NAME directly (which will be either the original or the default GNOME icon)
+        desktop_icon_ref="$ICON_NAME"
     fi
 
+    # Create desktop entry content
+    local desktop_content
+    read -r -d '' desktop_content <<EOF || true
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=$APP_NAME
+Exec="$INSTALL_DIR/${APP_NAME}.AppImage" %F
+Icon=$desktop_icon_ref
+Categories=Utility;
+Terminal=false
+EOF
+
     if $DRY_RUN; then
-        echo "[DRY RUN] Would create .desktop with content:"
-        cat <<EOF
-[Desktop Entry]
-Name=$APP_NAME
-Exec=$INSTALL_DIR/${APP_NAME}.AppImage
-Icon=$desktop_icon_ref
-Type=Application
-Categories=Utility;
-EOF
+        echo "[DRY RUN] Would create desktop entry with content:"
+        echo "$desktop_content"
     else
-        cat > "$dest_desktop" <<EOF
-[Desktop Entry]
-Name=$APP_NAME
-Exec=$INSTALL_DIR/${APP_NAME}.AppImage
-Icon=$desktop_icon_ref
-Type=Application
-Categories=Utility;
-EOF
+        if ! echo "$desktop_content" > "$dest_desktop"; then
+            echo "Error: Failed to create desktop entry file"
+            exit $ERR_INSTALL
+        fi
+        # Make the desktop entry executable
+        if ! chmod +x "$dest_desktop"; then
+            echo "Warning: Failed to make desktop entry executable"
+        fi
+    fi
+
+    # Update desktop database if available
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        if ! $DRY_RUN; then
+            update-desktop-database "$DESKTOP_ENTRY_DIR" >/dev/null 2>&1 || true
+        fi
     fi
 }
 
